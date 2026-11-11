@@ -1,0 +1,1323 @@
+package com.zyrox.music.ui.shorts
+
+import com.zyrox.music.util.KLog
+
+import android.content.Context
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import androidx.media3.common.AudioAttributes
+import androidx.media3.common.C
+import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
+import androidx.media3.common.Player
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.datasource.DefaultDataSource
+import androidx.media3.datasource.DataSpec
+import androidx.media3.exoplayer.DefaultLoadControl
+import com.zyrox.music.video.httpResponseCode
+import com.zyrox.music.video.isRecoverableSourceError
+import com.zyrox.music.video.isTransientRendererError
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.exoplayer.source.MergingMediaSource
+import androidx.media3.exoplayer.source.ProgressiveMediaSource
+import com.zyrox.music.data.LikeStatus
+import com.zyrox.music.data.ShortsItem
+import com.zyrox.music.data.ThemePreferences
+import com.zyrox.music.data.VideoEngagement
+import com.zyrox.music.data.VideoItem
+import com.zyrox.music.data.VideoQuality
+import com.zyrox.music.data.YouTubeRateLimit
+import com.zyrox.music.data.YouTubeRepository
+import com.zyrox.music.data.cappedAtHeight
+import com.zyrox.music.data.deviceVideoHeightCap
+import com.zyrox.music.data.bestSdrFallback
+import com.zyrox.music.ui.video.hasHdrDisplay
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.ensureActive
+
+/**
+ * Player for the vertical Shorts feed. Owns its own ExoPlayer (like
+ * VideoPlayerViewModel) so Shorts, regular video and music playback stay
+ * independent — audio focus keeps them from playing over each other.
+ *
+ * Streams resolve through the same ANDROID_VR /player pipeline as regular
+ * videos (Shorts are ordinary videos server-side), and engagement, metadata
+ * and comments come from the same single watch-next call per Short.
+ */
+@UnstableApi
+class ShortsPlayerViewModel(application: android.app.Application) : AndroidViewModel(application) {
+
+    private val context: Context get() = getApplication()
+    private val youtubeRepository = YouTubeRepository(context)
+    private val themePreferences = ThemePreferences(context)
+    private val videoHistoryRepository = com.zyrox.music.data.VideoHistoryRepository(context)
+
+    private var _exoPlayer: ExoPlayer? = null
+    val exoPlayer: ExoPlayer? get() = _exoPlayer
+
+    /**
+     * Move on to the next Short when one finishes, instead of looping it.
+     * Off by default, so a Short keeps looping until it is swiped.
+     */
+    val autoAdvance: StateFlow<Boolean> = themePreferences.shortsAutoAdvance
+
+    fun setAutoAdvance(enabled: Boolean) {
+        themePreferences.setShortsAutoAdvance(enabled)
+    }
+
+    /** True while a sheet is open over the Short: it keeps replaying instead. */
+    private var autoAdvanceHeld = false
+
+    fun setAutoAdvanceHeld(held: Boolean) {
+        autoAdvanceHeld = held
+    }
+
+    private fun repeatModeFor(autoAdvance: Boolean): Int =
+        if (autoAdvance) Player.REPEAT_MODE_OFF else Player.REPEAT_MODE_ONE
+
+    // ---------------- Feed / pager state ----------------
+
+    private val notInterestedRepository =
+        com.zyrox.music.data.NotInterestedRepository(context)
+
+    /** Local hide plus best-effort account propagation - see NotInterestedActions. */
+    private val notInterestedActions =
+        com.zyrox.music.data.NotInterestedActions(notInterestedRepository, youtubeRepository)
+
+    /**
+     * Re-read the playing Short's account state when the profile changes.
+     *
+     * Engagement and the prefetched watch-next data are the account's view, so
+     * after a switch they describe somebody else and the like button would be
+     * lit for the wrong person.
+     *
+     * The Shorts sequence itself is deliberately left in place. It is filtered
+     * on ingestion and addressed positionally by both the pager and playIndex,
+     * so swapping the list underneath someone mid-watch would move them to a
+     * different Short than the one on screen. Keep the loaded pages, but discard
+     * their continuation and seed the next extension from the new profile.
+     */
+    private fun observeProfileSwitches() {
+        viewModelScope.launch {
+            com.zyrox.music.data.ProfileManager(context)
+                .activeProfileId
+                .drop(1)
+                .distinctUntilChanged()
+                .collect {
+                    resetSequenceLoading()
+                    nextSequenceParams = null
+                    refreshSequenceForProfile = true
+                    _isLoggedIn.value = youtubeRepository.isLoggedIn()
+                    youtubeRepository.clearSessionScopedInstanceCaches()
+                    invalidatePrefetchedQualities()
+                    synchronized(watchNextCache) { watchNextCache.clear() }
+                    _engagement.value = null
+                    // The thread was the previous account's view of the Short.
+                    commentThread.clear()
+                    maybeLoadMore(_currentIndex.value)
+                    prefetchAround(_currentIndex.value)
+                    val playing = _currentVideo.value ?: return@collect
+                    val refreshed = runCatching {
+                        youtubeRepository.getVideoEngagement(playing.videoId)
+                    }.getOrNull() ?: return@collect
+                    if (_currentVideo.value?.videoId == playing.videoId) {
+                        _engagement.value = refreshed
+                    }
+                }
+        }
+    }
+
+    /**
+     * The swipe sequence.
+     *
+     * Unlike the grid feeds, this is filtered on the way *in* rather than by a
+     * derived flow. The pager index and [playIndex] both address this list
+     * positionally, so a filtered view layered on top would put the pager on
+     * item N of one list and playback on item N of another the moment anything
+     * was hidden. Dropping items as they arrive keeps one list and one index.
+     */
+    private val _shorts = MutableStateFlow<List<ShortsItem>>(emptyList())
+    val shorts: StateFlow<List<ShortsItem>> = _shorts.asStateFlow()
+
+    /**
+     * Hidden Shorts, and Shorts from blocked channels where the entry names
+     * its channel. Most sequence entries do not (see ShortsItem), so a channel
+     * block reaches the rest later: [dropUpcomingIfBlocked] when a prefetched
+     * watch-next names an upcoming Short's channel, and [playIndex] when the
+     * one on screen turns out to be from a blocked channel.
+     */
+    private fun withoutHidden(items: List<ShortsItem>): List<ShortsItem> =
+        items.filterNot {
+            notInterestedRepository.isVideoHidden(it.videoId) ||
+                ((it.channelId != null || it.channelName.isNotBlank()) &&
+                    notInterestedRepository.isCreatorBlocked(it.channelId, it.channelName))
+        }
+
+    private fun isFromBlockedChannel(data: com.zyrox.music.data.WatchNextData): Boolean {
+        val id = data.engagement?.channelId ?: data.updatedVideoItem?.channelId
+        val name = data.updatedVideoItem?.channelName
+        if (id == null && name.isNullOrBlank()) return false
+        return notInterestedRepository.isCreatorBlocked(id, name)
+    }
+
+    /**
+     * Take a Short out of the sequence ahead of the one playing, once its
+     * prefetched watch-next shows a blocked channel - before the user reaches
+     * it. Only strictly later positions: removing anything at or before the
+     * current index would move the pager and playback off the Short on screen.
+     */
+    private fun dropUpcomingIfBlocked(videoId: String, data: com.zyrox.music.data.WatchNextData) {
+        if (!isFromBlockedChannel(data)) return
+        val list = _shorts.value
+        val position = list.indexOfFirst { it.videoId == videoId }
+        if (position <= _currentIndex.value) return
+        _shorts.value = list.filterIndexed { index, _ -> index != position }
+    }
+
+    private val _currentIndex = MutableStateFlow(0)
+    val currentIndex: StateFlow<Int> = _currentIndex.asStateFlow()
+
+    private val _isActive = MutableStateFlow(false)
+    val isActive: StateFlow<Boolean> = _isActive.asStateFlow()
+
+    private val _isPlaying = MutableStateFlow(false)
+    val isPlaying: StateFlow<Boolean> = _isPlaying.asStateFlow()
+
+    private val _isBuffering = MutableStateFlow(false)
+    val isBuffering: StateFlow<Boolean> = _isBuffering.asStateFlow()
+
+    /**
+     * Stream URLs are being resolved for the open Short: the work between a
+     * page settling and the player being given anything to play.
+     *
+     * **The player is IDLE for the whole of it**, which is neither playing nor
+     * buffering, so a UI reading only those two concluded "paused" and put a
+     * pause badge over a Short that was loading - for as long as the resolve
+     * took, up to the 15s guard on a bad connection. Buffering is a state the
+     * player reports; this is the state before the player has been told
+     * anything, and only this class knows it is happening.
+     */
+    private val _isResolving = MutableStateFlow(false)
+    val isResolving: StateFlow<Boolean> = _isResolving.asStateFlow()
+
+    private val _playbackError = MutableStateFlow<Throwable?>(null)
+    val playbackError: StateFlow<Throwable?> = _playbackError.asStateFlow()
+
+    /** Network advice for a connection refusal; see VideoRecovery.connectionAdvice. */
+    private val _connectionAdvice = MutableStateFlow<com.zyrox.music.data.ConnectionAdvice?>(null)
+    val connectionAdvice: StateFlow<com.zyrox.music.data.ConnectionAdvice?> =
+        _connectionAdvice.asStateFlow()
+
+    private val connectionWatcher = com.zyrox.music.data.NetworkChangeWatcher(context) {
+        viewModelScope.launch { retryAfterNetworkChange() }
+    }
+
+    init {
+        viewModelScope.launch {
+            _playbackError.collect { error ->
+                val advice = error?.let { com.zyrox.music.data.connectionAdviceFor(context, it) }
+                _connectionAdvice.value = advice
+                if (advice != null) connectionWatcher.start() else connectionWatcher.stop()
+            }
+        }
+    }
+
+    private suspend fun retryAfterNetworkChange() {
+        if (_connectionAdvice.value == null || !_isActive.value) return
+        KLog.i("ShortsPlayerVM", "Network changed while YouTube was refusing the connection; retrying")
+        com.zyrox.music.data.YouTubeRepository.forgetConnectionVerdicts()
+        youtubeRepository.refreshVisitorDataAfterPlaybackFailure()
+        // Everything prefetched was resolved under the old address.
+        invalidatePrefetchedQualities()
+        if (_connectionAdvice.value != null && _isActive.value) retryCurrent()
+    }
+
+    /**
+     * A live broadcast that arrived through the Shorts feed, to be reopened in
+     * the main video player.
+     *
+     * Nothing in a reel entry says whether it is live - the feed hands back an
+     * id and a thumbnail, and the answer only shows up once the streams
+     * resolve. This player is the wrong home for one when it does: its seek bar
+     * describes a duration a live stream does not have, there is no chat, and
+     * swiping away mid-broadcast is not what the gesture means here. So it is
+     * handed off rather than approximated.
+     *
+     * No replay, one buffered slot: the collector is installed with the overlay
+     * host long before any Short is opened, and a replayed handoff would
+     * reopen the stream every time that host recomposed from scratch. The
+     * buffer is what keeps the emit from suspending.
+     */
+    private val _liveHandoff = kotlinx.coroutines.flow.MutableSharedFlow<VideoItem>(
+        replay = 0,
+        extraBufferCapacity = 1
+    )
+    val liveHandoff: kotlinx.coroutines.flow.SharedFlow<VideoItem> = _liveHandoff
+
+    /** Metadata of the current Short, enriched by watch-next (title, channel, avatar). */
+    private val _currentVideo = MutableStateFlow<VideoItem?>(null)
+    val currentVideo: StateFlow<VideoItem?> = _currentVideo.asStateFlow()
+
+    // Sequence continuation for the endless feed; null until known/exhausted
+    private var nextSequenceParams: String? = null
+    private var sequenceLoadJob: Job? = null
+    private var sequenceGeneration = 0L
+    private var refreshSequenceForProfile = false
+
+    private fun resetSequenceLoading() {
+        sequenceGeneration++
+        sequenceLoadJob?.cancel()
+        sequenceLoadJob = null
+    }
+    private var playJob: Job? = null
+    private var watchNextJob: Job? = null
+    private val watchTracker = com.zyrox.music.data.VideoWatchTracker(context, viewModelScope, youtubeRepository)
+    private var recoveryJob: Job? = null
+
+    /** When the previous Short started, to tell a swipe streak from a watch. */
+    private var lastPlayIndexAtMs = 0L
+
+    // Retry budgets for the current Short, reset by playIndex - see handlePlayerError.
+    private var rendererRetryCount = 0
+    private var sourceRetryCount = 0
+    private var currentQuality: VideoQuality? = null
+    private var hdrFallbackUsed = false
+
+    // ---------------- Background prefetch ----------------
+    // Resolve and warm the next Short after a brief settling delay to reduce
+    // loading on ordinary swipes without extracting several unseen videos.
+    // Swipe-back reuses cached ladders. Watch-next metadata is warmed for the
+    // next Short too. Both caches are LRU-capped.
+
+    private val qualitiesCache = object : LinkedHashMap<String, List<VideoQuality>>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, List<VideoQuality>>) =
+            size > 30
+    }
+    private val watchNextCache = object : LinkedHashMap<String, com.zyrox.music.data.WatchNextData>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, com.zyrox.music.data.WatchNextData>) =
+            size > 20
+    }
+    // Main-thread owned. Obsolete requests must not sit ahead of the next swipe.
+    private val prefetchJobs = mutableMapOf<String, Job>()
+    private val prefetchSemaphore = kotlinx.coroutines.sync.Semaphore(1)
+    private val metadataPrefetchSemaphore = kotlinx.coroutines.sync.Semaphore(1)
+
+    private fun cancelPrefetch() {
+        val jobs = prefetchJobs.values.toList()
+        prefetchJobs.clear()
+        jobs.forEach { it.cancel() }
+    }
+
+    private fun invalidatePrefetchedQualities() {
+        cancelPrefetch()
+        synchronized(qualitiesCache) {
+            qualitiesEpoch++
+            qualitiesCache.clear()
+        }
+    }
+
+    private fun launchPrefetch(
+        key: String,
+        semaphore: kotlinx.coroutines.sync.Semaphore,
+        work: suspend kotlinx.coroutines.CoroutineScope.() -> Unit
+    ) {
+        if (prefetchJobs[key]?.isActive == true) return
+        // Speculative by definition, so its requests are the app's own work.
+        // Stream ladders resolve in the shared cache's scope and are gated by
+        // canPrefetch instead; the watch-next prefetch is held by the policy.
+        val job = viewModelScope.launch(
+            com.zyrox.music.data.RequestPriority.Automatic,
+            start = CoroutineStart.LAZY,
+        ) {
+            try {
+                // A cancelled waiter cannot stop the shared blocking extraction.
+                // Avoid starting it at all for items passed during fast swipes.
+                delay(PREFETCH_SETTLE_MS)
+                semaphore.withPermit {
+                    // If the user already swiped here, foreground loading owns
+                    // this item. In particular, do not duplicate its /next call.
+                    if (canPrefetch() && key.substringAfter(':') != _currentVideo.value?.videoId) {
+                        work()
+                    }
+                }
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (e: Exception) {
+                KLog.w("ShortsPlayerVM", "Prefetch failed for $key", e)
+            } finally {
+                prefetchJobs.remove(key, coroutineContext[Job])
+            }
+        }
+        // Publish before starting: a fully cached warm can finish synchronously.
+        prefetchJobs[key] = job
+        job.start()
+    }
+
+    /**
+     * Bumped whenever the cache is purged because the token that minted its
+     * URLs was refused. A prefetch that was already in flight at that moment
+     * resolved under the dead token, so its result must be dropped rather than
+     * written back over the purge - otherwise recovery fixes the Short on
+     * screen and the upcoming swipes fail exactly as before.
+     */
+    private var qualitiesEpoch = 0
+
+    private fun cachedQualities(videoId: String): List<VideoQuality>? =
+        synchronized(qualitiesCache) { qualitiesCache[videoId] }
+
+    private fun cacheQualities(videoId: String, qualities: List<VideoQuality>, epoch: Int = qualitiesEpoch) {
+        if (qualities.isEmpty()) return
+        synchronized(qualitiesCache) {
+            if (epoch != qualitiesEpoch) return
+            qualitiesCache[videoId] = qualities
+        }
+    }
+
+    private fun cachedWatchNext(videoId: String): com.zyrox.music.data.WatchNextData? =
+        synchronized(watchNextCache) { watchNextCache[videoId] }
+
+    private fun cacheWatchNext(videoId: String, data: com.zyrox.music.data.WatchNextData) {
+        synchronized(watchNextCache) { watchNextCache[videoId] = data }
+    }
+
+    // A bot-check verdict stands prefetch down for the same reason a 429 does:
+    // resolving Shorts nobody has swiped to yet would repeat a refusal.
+    private fun canPrefetch(): Boolean =
+        _isActive.value && ThemePreferences.isPlaybackPreloadEnabled(context) &&
+            !YouTubeRateLimit.isHeld() &&
+            !com.zyrox.music.data.YouTubeRepository.isBotCheckVerdictActive()
+
+    /** Resolve and warm only the next Short; cached ladders still need media bytes. */
+    private fun prefetchAround(index: Int) {
+        if (!canPrefetch()) {
+            cancelPrefetch()
+            return
+        }
+        val list = _shorts.value
+        val streamTargets =
+            ((index + 1)..(index + STREAM_PREFETCH_AHEAD)).mapNotNull { list.getOrNull(it) }
+        val watchNextTargets =
+            ((index + 1)..(index + WATCH_NEXT_PREFETCH_AHEAD)).mapNotNull { list.getOrNull(it) }
+        val wanted = streamTargets.mapTo(mutableSetOf()) { "s:${it.videoId}" } +
+            watchNextTargets.map { "w:${it.videoId}" } +
+            listOfNotNull(list.getOrNull(index)).flatMap { listOf("s:${it.videoId}", "w:${it.videoId}") }
+        prefetchJobs.keys.filterNot { it in wanted }.forEach { key ->
+            prefetchJobs.remove(key)?.cancel()
+        }
+        for (item in streamTargets) {
+            val id = item.videoId
+            val epoch = qualitiesEpoch
+            launchPrefetch("s:$id", prefetchSemaphore) {
+                val qualities = cachedQualities(id) ?: resolvePlayableQualities(id).also {
+                    ensureActive()
+                    cacheQualities(id, it, epoch)
+                }
+                // Re-evaluate after resolution: a farther item may have become
+                // the immediate next Short while its extraction was in flight.
+                if (epoch == qualitiesEpoch && shouldWarmShort(id)) {
+                    warmPlayableHead(qualities)
+                }
+            }
+        }
+        for (item in watchNextTargets) {
+            val id = item.videoId
+            if (cachedWatchNext(id) != null) continue
+            launchPrefetch("w:$id", metadataPrefetchSemaphore) {
+                if (cachedWatchNext(id) == null) {
+                    val data = youtubeRepository.getWatchNextData(id, item.toVideoItem())
+                    ensureActive()
+                    cacheWatchNext(id, data)
+                    dropUpcomingIfBlocked(id, data)
+                }
+            }
+        }
+    }
+
+    private fun shouldWarmShort(videoId: String): Boolean {
+        if (!canPrefetch()) return false
+        return _shorts.value.getOrNull(_currentIndex.value + 1)?.videoId == videoId
+    }
+
+    /** Bounded audio/video heads only; live and adaptive manifests stay out of the cache. */
+    private suspend fun warmPlayableHead(qualities: List<VideoQuality>) {
+        if (!canPrefetch()) return
+        if (qualities.isEmpty()) return
+        val quality = pickDefaultQuality(qualities)
+        if (quality.isDASH || quality.isLive) return
+        val videoBytes = if (ThemePreferences.isNetworkMetered(context)) {
+            SHORTS_METERED_WARM_BYTES
+        } else {
+            SHORTS_UNMETERED_WARM_BYTES
+        }
+        withContext(Dispatchers.IO) {
+            suspend fun warm(uri: String, bytes: Long) {
+                ensureActive()
+                if (!canPrefetch()) return
+                val spec = DataSpec.Builder()
+                    .setUri(uri)
+                    .setPosition(0)
+                    .setLength(bytes)
+                    .build()
+                com.zyrox.music.data.CacheManager.cacheVideoRange(context, spec)
+            }
+            // Both tracks must be ready for a split rendition to start.
+            quality.audioUrl?.let { warm(it, SHORTS_AUDIO_WARM_BYTES) }
+            warm(quality.url, videoBytes)
+        }
+    }
+
+    // ---------------- Engagement ----------------
+
+    private val _engagement = MutableStateFlow<VideoEngagement?>(null)
+    val engagement: StateFlow<VideoEngagement?> = _engagement.asStateFlow()
+
+    private val subscriptionActions =
+        com.zyrox.music.data.SubscriptionActions(context, youtubeRepository)
+
+    /**
+     * Whether the current Short's channel is followed by the account or on
+     * this device - see VideoPlayerViewModel.isSubscribedToChannel.
+     */
+    val isSubscribedToChannel: StateFlow<Boolean> =
+        combine(_engagement, subscriptionActions.subscriptions) { engagement, localSubs ->
+            val channelId = engagement?.channelId
+            engagement?.isSubscribed == true ||
+                (channelId != null && localSubs.any { it.channelId == channelId })
+        }.stateIn(viewModelScope, SharingStarted.Eagerly, false)
+
+    /** True when the subscribe button has to send the user to sign in first. */
+    fun subscribeNeedsLogin(): Boolean = subscriptionActions.subscribeNeedsLogin()
+
+    private val _isLoggedIn = MutableStateFlow(youtubeRepository.isLoggedIn())
+    val isLoggedIn: StateFlow<Boolean> = _isLoggedIn.asStateFlow()
+
+    /** The open Short's comment thread; the comments sheet reads it directly. */
+    val commentThread = com.zyrox.music.video.CommentThreadController(
+        repository = youtubeRepository,
+        scope = viewModelScope,
+        viaBrowse = false,
+        signedIn = _isLoggedIn,
+    )
+
+    /**
+     * Stream data source factory: ChunkedStreamDataSource fetches googlevideo
+     * media in bounded ranged chunks (open-ended requests are server-paced to
+     * the media bitrate) and picks the per-request User-Agent matching the
+     * URL's issuing client — googlevideo answers 403 on a UA mismatch.
+     *
+     * Declared before [init] on purpose: the ExoPlayer built there installs it
+     * as the player-wide MediaSource factory, so a lazy declared further down
+     * the class would still be an uninitialised delegate at that point.
+     */
+    private val streamDataSourceFactory =
+        com.zyrox.music.data.CacheManager.createVideoPlaybackDataSourceFactory(context, shorts = true)
+
+    init {
+        observeProfileSwitches()
+        viewModelScope.launch {
+            autoAdvance.collect { enabled ->
+                _exoPlayer?.repeatMode = repeatModeFor(enabled)
+            }
+        }
+        viewModelScope.launch {
+            YouTubeRateLimit.heldUntil.collect {
+                if (YouTubeRateLimit.isHeld()) cancelPrefetch()
+            }
+        }
+        viewModelScope.launch {
+            themePreferences.preferHdr.drop(1).distinctUntilChanged().collect {
+                invalidatePrefetchedQualities()
+                prefetchAround(_currentIndex.value)
+            }
+        }
+    }
+
+    private fun ensurePlayer(): ExoPlayer {
+        _exoPlayer?.let { return it }
+
+        // Read-ahead keeps the next Short's start on disk. Start after 250ms
+        // of samples and recover after 500ms instead of waiting 1s/2.5s on
+        // every swipe; cap RAM so prefetching does not compete with an
+        // effectively unbounded current-video buffer.
+        val loadControl = DefaultLoadControl.Builder()
+            .setBufferDurationsMs(10_000, 30_000, 250, 500)
+            .setTargetBufferBytes(32 * 1024 * 1024)
+            .setPrioritizeTimeOverSizeThresholds(false)
+            .build()
+
+        // Every media source this player builds must fetch through
+        // ChunkedStreamDataSource. loadQuality() passes it explicitly for the
+        // progressive/merged paths, but the adaptive branch hands the player a
+        // bare MediaItem, which would otherwise be served by Media3's stock
+        // DefaultDataSource - no per-URL User-Agent, so googlevideo answers 403.
+        return ExoPlayer.Builder(context)
+            .setMediaSourceFactory(DefaultMediaSourceFactory(streamDataSourceFactory))
+            .setLoadControl(loadControl)
+            .setWakeMode(C.WAKE_MODE_NETWORK)
+            .setAudioAttributes(AudioAttributes.DEFAULT, true)
+            .setHandleAudioBecomingNoisy(true)
+            .build().apply {
+                playWhenReady = true
+                // Shorts loop, YouTube-style, unless auto-advance is on
+                repeatMode = repeatModeFor(autoAdvance.value)
+                addListener(object : Player.Listener {
+                    override fun onIsPlayingChanged(isPlaying: Boolean) {
+                        _isPlaying.value = isPlaying
+                    }
+
+                    override fun onPlaybackStateChanged(playbackState: Int) {
+                        _isBuffering.value = playbackState == Player.STATE_BUFFERING
+                        if (playbackState == Player.STATE_ENDED) onShortEnded()
+                    }
+
+                    override fun onPlayerError(error: PlaybackException) {
+                        handlePlayerError(error)
+                    }
+                })
+            }.also { _exoPlayer = it }
+    }
+
+    /**
+     * Open the Shorts player on a shelf: [items] become the initial pager
+     * feed, [startIndex] is the tapped Short. The tapped item's
+     * sequenceParams seed the endless feed once the user swipes near the end.
+     */
+    fun open(items: List<ShortsItem>, startIndex: Int) {
+        if (items.isEmpty()) return
+        cancelPrefetch()
+        resetSequenceLoading()
+        refreshSequenceForProfile = false
+        com.zyrox.music.data.CacheManager.setVideoPlaybackActive(SHORTS_CACHE_OWNER, true)
+        ensurePlayer()
+        // Keep the tapped Short even if it is hidden - the user asked for this
+        // one explicitly, and opening onto a different video would be baffling.
+        val tapped = items.getOrNull(startIndex.coerceIn(0, items.size - 1))
+        val visible = withoutHidden(items).ifEmpty { listOfNotNull(tapped) }
+        val ordered = if (tapped != null && tapped !in visible) listOf(tapped) + visible else visible
+        if (ordered.isEmpty()) return
+        val index = ordered.indexOf(tapped).coerceAtLeast(0)
+        _shorts.value = ordered
+        _currentIndex.value = index
+        nextSequenceParams = ordered[index].sequenceParams
+            ?: ordered.firstNotNullOfOrNull { it.sequenceParams }
+        _isActive.value = true
+        _isLoggedIn.value = youtubeRepository.isLoggedIn()
+        playIndex(index)
+        prefetchAround(index)
+        maybeLoadMore(index)
+    }
+
+    /**
+     * A Short played to its end with auto-advance on (with it off the player
+     * loops and never reaches ENDED). Move to the next one; at the end of the
+     * loaded feed, replay this one rather than stopping on a frozen frame
+     * while the next page is still loading.
+     */
+    private fun onShortEnded() {
+        if (!_isActive.value) return
+        if (autoAdvanceHeld || !playNext()) {
+            _exoPlayer?.seekTo(0L)
+            playWhenVisible()
+        }
+    }
+
+    /**
+     * Step to the next Short. The pager follows [currentIndex], so this works
+     * the same whether the feed is on screen or the app is in picture-in-picture
+     * with no pager composed. Returns false when there is no next Short yet.
+     */
+    fun playNext(): Boolean {
+        if (!_isActive.value) return false
+        val next = _currentIndex.value + 1
+        if (next > _shorts.value.lastIndex) {
+            maybeLoadMore(_currentIndex.value)
+            return false
+        }
+        onPageSelected(next)
+        return true
+    }
+
+    /** Step back to the previous Short, if there is one. */
+    fun playPrevious(): Boolean {
+        if (!_isActive.value) return false
+        val previous = _currentIndex.value - 1
+        if (previous < 0) return false
+        onPageSelected(previous)
+        return true
+    }
+
+    /** Called by the pager when the user settles on a page. */
+    fun onPageSelected(index: Int) {
+        if (!_isActive.value) return
+        if (index != _currentIndex.value) {
+            _currentIndex.value = index
+            playIndex(index)
+        }
+        prefetchAround(index)
+        maybeLoadMore(index)
+    }
+
+    /**
+     * Hide the Short on screen and move on.
+     *
+     * A grid can just drop an item, but a Shorts feed shows exactly one thing,
+     * so dismissing has to say where the user lands. The item is pulled out of
+     * the list and the pager holds its index, which now addresses the next
+     * Short - or the previous one when the dismissed Short was last.
+     */
+    fun markCurrentNotInterested() {
+        val video = _currentVideo.value ?: return
+        notInterestedActions.hideVideo(video, viewModelScope)
+        dropCurrentAndAdvance(video.videoId)
+    }
+
+    /** Stop recommending this Short's channel, and move on. */
+    fun blockChannelForCurrent() {
+        val video = _currentVideo.value ?: return
+        notInterestedActions.blockChannel(video, viewModelScope)
+        dropCurrentAndAdvance(video.videoId)
+    }
+
+    private fun dropCurrentAndAdvance(videoId: String) {
+        val remaining = _shorts.value.filterNot { it.videoId == videoId }
+        if (remaining.isEmpty()) {
+            close()
+            return
+        }
+        _shorts.value = remaining
+        val target = _currentIndex.value.coerceIn(0, remaining.lastIndex)
+        _currentIndex.value = target
+        playIndex(target)
+        prefetchAround(target)
+    }
+
+    fun close() {
+        cancelPrefetch()
+        resetSequenceLoading()
+        nextSequenceParams = null
+        refreshSequenceForProfile = false
+        _isActive.value = false
+        playDeferredToForeground = false
+        playJob?.cancel()
+        watchNextJob?.cancel()
+        // Reopening is a fresh tap, never the tail of a streak.
+        lastPlayIndexAtMs = 0L
+        watchTracker.close()
+        recoveryJob?.cancel()
+        _exoPlayer?.stop()
+        _exoPlayer?.clearMediaItems()
+        _currentVideo.value = null
+        currentQuality = null
+        _playbackError.value = null
+        com.zyrox.music.data.CacheManager.setVideoPlaybackActive(SHORTS_CACHE_OWNER, false)
+    }
+
+    /**
+     * Seek the current Short: a description timestamp (precise) or a scrub
+     * (nearest keyframe, which lands without a decode-ahead stall).
+     *
+     * Clamped at zero only: a timestamp past the end is YouTube's data being
+     * wrong about its own video, and ExoPlayer already clamps to the duration.
+     */
+    fun seekTo(positionMs: Long, precise: Boolean = true) {
+        val player = _exoPlayer ?: return
+        player.setSeekParameters(
+            if (precise) androidx.media3.exoplayer.SeekParameters.EXACT
+            else androidx.media3.exoplayer.SeekParameters.CLOSEST_SYNC
+        )
+        player.seekTo(positionMs.coerceAtLeast(0L))
+    }
+
+    fun togglePlayPause() {
+        if (_isPlaying.value) _exoPlayer?.pause() else play()
+    }
+
+    /** Resume, restarting a Short that finished at the end of the feed. */
+    fun play() {
+        val player = _exoPlayer ?: return
+        if (player.playbackState == Player.STATE_ENDED) player.seekTo(0L)
+        player.play()
+    }
+
+    /** Pause without closing (e.g. app backgrounded while a Short is open). */
+    fun pause() {
+        _exoPlayer?.pause()
+    }
+
+    private var isInBackground = false
+    private var playDeferredToForeground = false
+
+    /**
+     * The app stopped being visible (screen locked, home, another app).
+     *
+     * More than a pause: a Short that is still resolving, recovering or
+     * falling back when this lands used to finish that work and call play()
+     * anyway, so it started sounding behind the lock screen.
+     */
+    fun onEnterBackground() {
+        isInBackground = true
+        _exoPlayer?.pause()
+    }
+
+    /** Visible again: start only what finished loading while it was hidden. */
+    fun onEnterForeground() {
+        isInBackground = false
+        if (playDeferredToForeground) {
+            playDeferredToForeground = false
+            if (_isActive.value) _exoPlayer?.play()
+        }
+    }
+
+    /** play() for work that completes on its own time rather than on a tap. */
+    private fun playWhenVisible() {
+        if (isInBackground) playDeferredToForeground = true else _exoPlayer?.play()
+    }
+
+    /** Re-attempt playback of the current Short after an error. */
+    fun retryCurrent() {
+        rendererRetryCount = 0
+        sourceRetryCount = 0
+        // The cached URLs for this Short are what just failed, and a manual
+        // retry is the user telling us the automatic recovery did not work.
+        // playIndex would otherwise replay them straight out of the cache.
+        currentItem()?.let { synchronized(qualitiesCache) { qualitiesCache.remove(it.videoId) } }
+        playIndex(_currentIndex.value)
+    }
+
+    private fun currentItem(): ShortsItem? = _shorts.value.getOrNull(_currentIndex.value)
+
+    /**
+     * Recover from a player-level failure, or surface it.
+     *
+     * Without this the Shorts player registered no error listener at all: a
+     * fatal error drives the player to STATE_IDLE, whose handler clears
+     * [_isBuffering], so a refused Short sat on a frozen frame with no spinner,
+     * no error and no way back. That is survivable in the other two surfaces
+     * only because they re-mint and `visitorData` is process-wide - a session
+     * that opens straight into Shorts never gets that repair.
+     *
+     * Mirrors VideoPlayerViewModel: a renderer failure is the codec, not the
+     * stream, so it re-prepares in place; a source failure means the URL is
+     * dead and only re-resolving can help.
+     */
+    private fun handlePlayerError(error: PlaybackException) {
+        if (fallbackFromHdr(error)) return
+
+        if (isTransientRendererError(error) && rendererRetryCount < MAX_RENDERER_RETRIES) {
+            rendererRetryCount++
+            KLog.w(
+                "ShortsPlayerVM",
+                "Transient renderer error (attempt $rendererRetryCount/$MAX_RENDERER_RETRIES); re-preparing",
+                error
+            )
+            _exoPlayer?.prepare()
+            return
+        }
+
+        if (isRecoverableSourceError(error) && sourceRetryCount < MAX_SOURCE_RETRIES) {
+            sourceRetryCount++
+            KLog.w(
+                "ShortsPlayerVM",
+                "Source error (attempt $sourceRetryCount/$MAX_SOURCE_RETRIES); re-resolving stream",
+                error
+            )
+            recoverFromSourceError(error)
+            return
+        }
+
+        _playbackError.value = error
+        _isBuffering.value = false
+    }
+
+    private suspend fun resolvePlayableQualities(videoId: String): List<VideoQuality> {
+        val includeHdr = themePreferences.isPreferHdrEnabled() && hasHdrDisplay(context)
+        val qualities = youtubeRepository.getVideoStreamQualities(videoId, includeHdr)
+        return if (includeHdr) {
+            qualities
+        } else {
+            qualities.filterNot(VideoQuality::isHdr)
+        }
+    }
+
+    /**
+     * One-shot HDR-to-SDR recovery. Not for a 403: HDR and SDR are signed
+     * under one token, so the SDR URL is refused too, and reloading it spent
+     * a second token replacement; [recoverFromSourceError] re-resolves instead.
+     * Mirrors VideoPlayerViewModel.
+     */
+    private fun fallbackFromHdr(error: PlaybackException): Boolean {
+        val failed = currentQuality ?: return false
+        if (!failed.isHdr || hdrFallbackUsed) return false
+        if (httpResponseCode(error) == 403) return false
+        val item = currentItem() ?: return false
+        val qualities = cachedQualities(item.videoId).orEmpty()
+        val fallback = bestSdrFallback(qualities, failed) ?: return false
+
+        hdrFallbackUsed = true
+        val position = _exoPlayer?.currentPosition?.coerceAtLeast(0L) ?: 0L
+        KLog.w(
+            "ShortsPlayerVM",
+            "HDR ${failed.displayLabel} failed; falling back to ${fallback.displayLabel}",
+            error,
+        )
+        loadQuality(fallback, startAtMs = position)
+        playWhenVisible()
+        return true
+    }
+
+    /**
+     * Mint a fresh visitorData when googlevideo refused us outright, then
+     * re-resolve the Short on screen and reload at the position it died on.
+     *
+     * The cache purge is the part that is specific to this surface. Stream URLs
+     * for the upcoming Shorts are already resolved and sitting in
+     * [qualitiesCache], every one of them minted under the token that just got
+     * refused, so keeping them would hand the same dead URLs to the next
+     * swipes and make the re-mint look like it did nothing.
+     */
+    private fun recoverFromSourceError(original: PlaybackException) {
+        val item = currentItem()
+        if (item == null) {
+            _playbackError.value = original
+            _isBuffering.value = false
+            return
+        }
+        val index = _currentIndex.value
+        val resumeAt = _exoPlayer?.currentPosition?.coerceAtLeast(0L) ?: 0L
+        _isBuffering.value = true
+        recoveryJob?.cancel()
+        recoveryJob = viewModelScope.launch {
+            try {
+                if (httpResponseCode(original) == 403) {
+                    youtubeRepository.refreshVisitorDataAfterPlaybackFailure(
+                        com.zyrox.music.data.httpFailureUrl(original),
+                    )
+                    invalidatePrefetchedQualities()
+                } else {
+                    synchronized(qualitiesCache) { qualitiesCache.remove(item.videoId) }
+                }
+                youtubeRepository.invalidateVideoStreamResult(item.videoId)
+                val qualities = kotlinx.coroutines.withTimeout(15_000L) {
+                    resolvePlayableQualities(item.videoId)
+                }
+                // The user swiped on while we were resolving; that Short owns
+                // the player now and this recovery has nothing left to fix.
+                if (_currentIndex.value != index) return@launch
+                if (qualities.isEmpty()) {
+                    _playbackError.value = original
+                    _isBuffering.value = false
+                    return@launch
+                }
+                cacheQualities(item.videoId, qualities)
+                loadQuality(pickDefaultQuality(qualities), startAtMs = resumeAt)
+                playWhenVisible()
+                _playbackError.value = null
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                KLog.w("ShortsPlayerVM", "Recovery failed for ${item.videoId}", e)
+                if (_currentIndex.value == index) {
+                    _playbackError.value = original
+                    _isBuffering.value = false
+                }
+            }
+        }
+    }
+
+    private fun playIndex(index: Int) {
+        val item = _shorts.value.getOrNull(index) ?: return
+        com.zyrox.music.data.YouTubeRequestLedger.begin("short ${item.videoId}")
+        // Mid-streak, a Short with nothing cached waits a moment before any
+        // network work. A cancelled job cannot stop a NewPipe extraction that
+        // has started (eight blocking requests, three fresh visitor ids), so
+        // a skimmer used to pay that in full for every Short flicked past.
+        // Waiting is cheap to cancel; the extraction is not.
+        val now = android.os.SystemClock.elapsedRealtime()
+        val inSwipeStreak = now - lastPlayIndexAtMs < SWIPE_STREAK_MS
+        lastPlayIndexAtMs = now
+        playJob?.cancel()
+        watchNextJob?.cancel()
+        watchTracker.close()
+        recoveryJob?.cancel()
+        // Per Short, so a run of unrelated failures across the feed does not
+        // exhaust the budget for the one the user is actually watching.
+        rendererRetryCount = 0
+        sourceRetryCount = 0
+        hdrFallbackUsed = false
+        currentQuality = null
+
+        _playbackError.value = null
+        _currentVideo.value = item.toVideoItem()
+        resetEngagementState()
+
+        // Phase 1: streams only, playback ASAP (same two-phase pattern and
+        // 15s stuck-buffering guard as VideoPlayerViewModel.playVideo).
+        // Prefetched ladders skip extraction; warmed media heads let source
+        // preparation read the first audio/video samples from disk.
+        playJob = viewModelScope.launch {
+            _isResolving.value = true
+            try {
+                _exoPlayer?.stop()
+                _exoPlayer?.clearMediaItems()
+                if (inSwipeStreak && cachedQualities(item.videoId) == null) {
+                    delay(COLD_RESOLVE_DWELL_MS)
+                }
+                kotlinx.coroutines.withTimeout(15_000L) {
+                    val qualities = cachedQualities(item.videoId)
+                        ?: resolvePlayableQualities(item.videoId)
+                            .also { cacheQualities(item.videoId, it) }
+                    if (_currentIndex.value != index) return@withTimeout
+                    // Live arrived in the reel feed: hand it to the video
+                    // player, which has the vertical live layout and chat, and
+                    // stand down before touching the surface.
+                    if (qualities.any { it.isLive }) {
+                        val handoff = _currentVideo.value?.takeIf { it.videoId == item.videoId }
+                            ?: item.toVideoItem()
+                        // Emit before close(): close() cancels this very job, so
+                        // a suspending emit after it would be cancelled instead
+                        // of delivered.
+                        _liveHandoff.emit(handoff)
+                        close()
+                        return@withTimeout
+                    }
+                    if (qualities.isNotEmpty()) {
+                        loadQuality(pickDefaultQuality(qualities))
+                        playWhenVisible()
+                    } else {
+                        // No second NewPipe extraction: it repeats the failure
+                        // the resolver just had (see VideoPlayerViewModel).
+                        _playbackError.value = Exception("Unable to load this Short")
+                    }
+                }
+            } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
+                _playbackError.value = Exception("Connection timed out. Please check your internet.")
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _playbackError.value = e
+            } finally {
+                // Only if this job is still the current one. `finally` also
+                // runs on cancellation, and the thing that cancels this job is
+                // the next Short starting - which has already set the flag for
+                // itself by the time we get here, so clearing it unconditionally
+                // would report the incoming Short as resolved before it began.
+                if (_currentIndex.value == index) _isResolving.value = false
+            }
+        }
+
+        // Phase 2: one watch-next call fills engagement + real metadata
+        // (title, channel, avatar) — sequence entries arrive with id only.
+        // Prefetched payloads make the metadata and like rail appear at once.
+        // Tracked, and gated like the streams above: a Short flicked past no
+        // longer leaves its /next behind it.
+        watchNextJob = viewModelScope.launch {
+            try {
+                val cached = cachedWatchNext(item.videoId)
+                if (cached == null && inSwipeStreak) delay(COLD_RESOLVE_DWELL_MS)
+                val watchNext = cached
+                    ?: youtubeRepository.getWatchNextData(item.videoId, item.toVideoItem())
+                        .also { cacheWatchNext(item.videoId, it) }
+                if (_currentIndex.value != index) return@launch
+                // The sequence gave no channel for this one; now there is.
+                // A blocked channel is passed over rather than played.
+                if (isFromBlockedChannel(watchNext)) {
+                    dropCurrentAndAdvance(item.videoId)
+                    return@launch
+                }
+                _engagement.value = watchNext.engagement
+                if (watchNext.updatedVideoItem != null) {
+                    _currentVideo.value = watchNext.updatedVideoItem
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                KLog.w("ShortsPlayerVM", "watch-next failed for ${item.videoId}", e)
+            }
+        }
+
+        _exoPlayer?.let { player ->
+            watchTracker.start(player, { _currentVideo.value }, thresholdMs = 5_000L)
+        }
+    }
+
+    /** Extend the feed when the pager nears its end. Dedupes repeated and already-watched ids. */
+    private fun maybeLoadMore(index: Int) {
+        if (!_isActive.value || sequenceLoadJob?.isActive == true ||
+            index < _shorts.value.size - STREAM_PREFETCH_AHEAD - 2) return
+        if (nextSequenceParams == null && !refreshSequenceForProfile) return
+        val generation = sequenceGeneration
+        val profiles = com.zyrox.music.data.ProfileManager(context)
+        val profileId = profiles.activeProfileId.value
+        val sessions = com.zyrox.music.data.SessionManager(context)
+        val session = sessions.captureSession()
+        sequenceLoadJob = viewModelScope.launch {
+            try {
+                // Duplicate/hidden-only pages must not strand the pager at its
+                // end waiting for a page selection that cannot happen. Bound
+                // this catch-up so an unhelpful server cannot cause a busy loop.
+                repeat(3) {
+                    val previous = nextSequenceParams
+                    val page = if (refreshSequenceForProfile) {
+                        val items = youtubeRepository.getShortsFeed()
+                        com.zyrox.music.data.ShortsFeedPage(
+                            items, items.firstNotNullOfOrNull { it.sequenceParams }
+                        )
+                    } else {
+                        youtubeRepository.getShortsSequence(nextSequenceParams ?: return@launch)
+                    }
+                    ensureActive()
+                    if (generation != sequenceGeneration || !_isActive.value ||
+                        profiles.activeProfileId.value != profileId ||
+                        (if (session != null) sessions.currentSession(session) == null
+                         else sessions.captureSession() != null)) return@launch
+                    val known = _shorts.value.mapTo(HashSet()) { it.videoId }
+                    // Shorts already watched in ZYROX MUSIC are skipped too. The feed
+                    // kept serving the same ones back across sessions, and a
+                    // Short is not something people come back to on purpose -
+                    // unlike the shelf they tapped, which is left as it was.
+                    // An all-watched page falls through to the next one below,
+                    // the same as an all-duplicate page.
+                    val fresh = withoutHidden(
+                        page.items.distinctBy { it.videoId }.filter {
+                            it.videoId !in known && !videoHistoryRepository.isWatched(it.videoId)
+                        }
+                    )
+                    refreshSequenceForProfile = false
+                    nextSequenceParams = page.continuation?.takeUnless { it == previous }
+                    if (fresh.isNotEmpty()) {
+                        _shorts.value = _shorts.value + fresh
+                        prefetchAround(_currentIndex.value)
+                        return@launch
+                    }
+                    if (nextSequenceParams == null) return@launch
+                }
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (e: Exception) {
+                // Retain the last successful continuation for the next swipe.
+                KLog.w("ShortsPlayerVM", "Shorts sequence failed; keeping continuation", e)
+            }
+        }
+    }
+
+    // ---------------- Playback helpers (same conventions as the video player) ----------------
+
+    /**
+     * Starting quality from the per-network video quality setting (fresh pref
+     * read), like VideoPlayerViewModel.pickDefaultQuality. The list is sorted
+     * highest-first, so the first label at or below the target height wins.
+     */
+    private fun pickDefaultQuality(qualities: List<VideoQuality>): VideoQuality {
+        fun height(label: String): Int = label.takeWhile { it.isDigit() }.toIntOrNull() ?: 0
+        // Same device cap as the watch page: cappedAtHeight never empties, so
+        // the first() fallbacks below stay safe.
+        val options = qualities.cappedAtHeight(context.deviceVideoHeightCap())
+        val preferred = themePreferences.getDefaultVideoQuality()
+        if (preferred == ThemePreferences.VIDEO_QUALITY_AUTO) {
+            return options.firstOrNull { height(it.resolution) > 0 } ?: options.first()
+        }
+        val targetHeight = height(preferred)
+        return options.firstOrNull { height(it.resolution) in 1..targetHeight }
+            ?: options.lastOrNull { height(it.resolution) > 0 }
+            ?: options.first()
+    }
+
+    /**
+     * @param startAtMs where to resume. Non-zero only on the recovery path,
+     * which reloads a Short that died partway through and should not restart it
+     * from the top.
+     */
+    private fun loadQuality(quality: VideoQuality, startAtMs: Long = 0L) {
+        currentQuality = quality
+        // Adaptive manifests carry no progressive URL to wrap: hand the
+        // MediaItem to the player and let its MediaSource factory build the
+        // DASH/HLS source. Feeding a manifest to ProgressiveMediaSource (what
+        // this used to do for every quality) fails extraction outright.
+        if (quality.isDASH) {
+            _exoPlayer?.setMediaItem(
+                MediaItem.Builder()
+                    .setUri(quality.url)
+                    .setMimeType(adaptiveMimeType(quality))
+                    .build(),
+                startAtMs
+            )
+            _exoPlayer?.prepare()
+            return
+        }
+
+        val dataSourceFactory = streamDataSourceFactory
+        val audioUrl = quality.audioUrl
+        if (audioUrl != null) {
+            val videoSource = ProgressiveMediaSource.Factory(dataSourceFactory)
+                .createMediaSource(MediaItem.fromUri(quality.url))
+            val audioSource = ProgressiveMediaSource.Factory(dataSourceFactory)
+                .createMediaSource(MediaItem.fromUri(audioUrl))
+            _exoPlayer?.setMediaSource(MergingMediaSource(true, videoSource, audioSource), startAtMs)
+        } else {
+            val source = ProgressiveMediaSource.Factory(dataSourceFactory)
+                .createMediaSource(MediaItem.fromUri(quality.url))
+            _exoPlayer?.setMediaSource(source, startAtMs)
+        }
+        _exoPlayer?.prepare()
+    }
+
+    /**
+     * MIME for an adaptive quality. Both DASH and HLS entries arrive with
+     * isDASH set and are told apart only by [VideoQuality.format], so pinning
+     * MPD unconditionally would make the factory build a DashMediaSource for an
+     * m3u8 playlist and fail the load.
+     */
+    private fun adaptiveMimeType(quality: VideoQuality): String =
+        if (quality.format.equals("HLS", ignoreCase = true)) {
+            androidx.media3.common.MimeTypes.APPLICATION_M3U8
+        } else {
+            androidx.media3.common.MimeTypes.APPLICATION_MPD
+        }
+
+    // ---------------- Engagement actions (optimistic with rollback) ----------------
+
+    /** Re-check login state and refresh engagement (call after a sign-in). */
+    fun onLoginStateChanged() {
+        _isLoggedIn.value = youtubeRepository.isLoggedIn()
+        val video = _currentVideo.value ?: return
+        viewModelScope.launch {
+            _engagement.value = youtubeRepository.getVideoEngagement(video.videoId)
+        }
+    }
+
+    fun toggleLike() = rate { current ->
+        if (current == LikeStatus.LIKE) LikeStatus.INDIFFERENT else LikeStatus.LIKE
+    }
+
+    fun toggleDislike() = rate { current ->
+        if (current == LikeStatus.DISLIKE) LikeStatus.INDIFFERENT else LikeStatus.DISLIKE
+    }
+
+    private fun rate(target: (LikeStatus) -> LikeStatus) {
+        val current = _engagement.value ?: return
+        val newStatus = target(current.likeStatus)
+        _engagement.value = current.copy(likeStatus = newStatus)
+        viewModelScope.launch {
+            val ok = youtubeRepository.rateVideo(current.videoId, newStatus)
+            if (!ok && _engagement.value?.videoId == current.videoId) {
+                _engagement.value = _engagement.value?.copy(likeStatus = current.likeStatus)
+            }
+        }
+    }
+
+    /**
+     * Subscribe/unsubscribe to the current Short's channel, routed by the
+     * subscribe-target setting. Same contract as the video player's.
+     */
+    fun toggleSubscribe() {
+        val current = _engagement.value ?: return
+        val channelId = current.channelId ?: return
+        val video = _currentVideo.value
+        val subscribe = !isSubscribedToChannel.value
+
+        val writesRemote =
+            subscriptionActions.resolveTarget() != com.zyrox.music.data.SubscriptionStore.LOCAL
+        _engagement.value = current.copy(
+            isSubscribed = when {
+                !subscribe -> false
+                writesRemote -> true
+                else -> current.isSubscribed
+            }
+        )
+        viewModelScope.launch {
+            val ok = subscriptionActions.setSubscribed(
+                channel = com.zyrox.music.data.LocalSubscription(
+                    channelId = channelId,
+                    name = video?.channelName?.takeIf { it.isNotBlank() } ?: channelId,
+                    avatarUrl = video?.channelIconUrl
+                ),
+                subscribe = subscribe,
+                remotelySubscribed = current.isSubscribed
+            )
+            if (!ok && _engagement.value?.videoId == current.videoId) {
+                _engagement.value = _engagement.value?.copy(isSubscribed = current.isSubscribed)
+            }
+        }
+    }
+
+    // ---------------- Comments ----------------
+
+    private fun resetEngagementState() {
+        _engagement.value = null
+        commentThread.clear()
+        _isLoggedIn.value = youtubeRepository.isLoggedIn()
+    }
+
+    /** Open this Short's comment thread if it is not open already. */
+    fun ensureCommentsLoaded() {
+        val video = _currentVideo.value ?: return
+        val token = _engagement.value?.commentsToken ?: return
+        commentThread.ensureLoaded(video.videoId) { token }
+    }
+
+    companion object {
+        private const val SHORTS_CACHE_OWNER = "shorts"
+        private const val PREFETCH_SETTLE_MS = 750L
+
+        /**
+         * A Short started within this long of the previous one is part of a
+         * swipe streak. Long enough to cover a flick and its settle animation;
+         * a Short actually watched, even briefly, is outside it, so ordinary
+         * swiping never waits.
+         */
+        private const val SWIPE_STREAK_MS = 1_500L
+
+        /**
+         * How long a cold Short in a streak waits before its extraction and
+         * /next start. Spent under the thumbnail and spinner; a Short passed
+         * within it costs no requests at all.
+         */
+        private const val COLD_RESOLVE_DWELL_MS = 450L
+
+        /** Speculative work is limited to the immediate next Short. */
+        private const val STREAM_PREFETCH_AHEAD = 1
+
+        /** Watch-next payloads (metadata + engagement) warmed ahead. */
+        private const val WATCH_NEXT_PREFETCH_AHEAD = 1
+
+        private const val SHORTS_METERED_WARM_BYTES = 512L * 1024
+        private const val SHORTS_UNMETERED_WARM_BYTES = 2L * 1024 * 1024
+        private const val SHORTS_AUDIO_WARM_BYTES = 256L * 1024
+
+        /** Silent re-prepare attempts before a renderer error reaches the UI. */
+        private const val MAX_RENDERER_RETRIES = 2
+
+        /**
+         * Silent re-resolve attempts before a source error reaches the UI. One
+         * is enough: the first pass already remints a rejected visitorData and
+         * fetches brand-new URLs, so a second failure means the Short really is
+         * unplayable and the user should get the retry button, not a spinner.
+         */
+        private const val MAX_SOURCE_RETRIES = 1
+    }
+
+    override fun onCleared() {
+        connectionWatcher.stop()
+        cancelPrefetch()
+        watchTracker.close()
+        super.onCleared()
+        _exoPlayer?.release()
+        _exoPlayer = null
+        com.zyrox.music.data.CacheManager.setVideoPlaybackActive(SHORTS_CACHE_OWNER, false)
+    }
+}

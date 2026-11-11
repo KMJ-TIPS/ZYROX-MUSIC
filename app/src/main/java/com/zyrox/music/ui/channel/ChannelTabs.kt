@@ -1,0 +1,1762 @@
+package com.zyrox.music.ui.channel
+
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculatePan
+import androidx.compose.foundation.gestures.calculateZoom
+import androidx.compose.ui.draw.drawBehind
+import com.zyrox.music.video.core.hasVoted
+import com.zyrox.music.video.core.shareRatio
+import com.zyrox.music.video.core.shareText
+import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.statusBars
+import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.grid.GridItemSpan
+import androidx.compose.foundation.lazy.grid.LazyGridScope
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.Article
+import androidx.compose.material.icons.automirrored.rounded.Comment
+import androidx.compose.material.icons.automirrored.rounded.Sort
+import androidx.compose.material.icons.rounded.CalendarMonth
+import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.Link
+import androidx.compose.material.icons.rounded.Person
+import androidx.compose.material.icons.rounded.PlayArrow
+import androidx.compose.material.icons.rounded.Public
+import androidx.compose.material.icons.rounded.Search
+import androidx.compose.material.icons.rounded.Check
+import androidx.compose.material.icons.rounded.ThumbUp
+import androidx.compose.material.icons.rounded.VideoLibrary
+import androidx.compose.material.icons.rounded.Visibility
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
+import androidx.compose.material3.Icon
+import androidx.compose.material3.LoadingIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
+import coil.compose.AsyncImage
+import com.zyrox.music.R
+import com.zyrox.music.ui.components.VideoThumbnail
+import com.zyrox.music.ui.components.VideoThumbnailBadge
+import com.zyrox.music.data.ChannelAbout
+import com.zyrox.music.data.ChannelPost
+import com.zyrox.music.data.ChannelShelf
+import com.zyrox.music.data.ChannelSortOption
+import com.zyrox.music.data.ChannelTab
+import com.zyrox.music.data.ChannelTabKind
+import com.zyrox.music.data.ChannelTabPage
+import com.zyrox.music.data.ShortsItem
+import com.zyrox.music.data.SubscribedChannel
+import com.zyrox.music.data.VideoItem
+import com.zyrox.music.data.VideoPlaylist
+import com.zyrox.music.ui.components.SearchField
+import com.zyrox.music.ui.video.VideoCard
+
+/**
+ * The About entry the UI adds to the tab row. Carries no `params`, because
+ * there is no browse behind it - see [ChannelTabKind.ABOUT].
+ */
+internal val ABOUT_TAB = ChannelTab(ChannelTabKind.ABOUT, "About", "")
+
+/**
+ * What the tab strip - and the swipe gesture, which must move through the
+ * same order - may land on.
+ *
+ * The response advertises a Search tab that carries no content (its page is
+ * always empty), so it is dropped here rather than shown as a dead button.
+ * Search itself is unaffected: the header action opens the search pane, and
+ * its availability is still read off the raw tab list via [ChannelTabKind.SEARCH].
+ */
+internal fun channelTabEntries(tabs: List<ChannelTab>): List<ChannelTab> =
+    tabs.filterNot { it.kind == ChannelTabKind.SEARCH } + ABOUT_TAB
+
+/**
+ * The body of whichever tab is open, emitted into the channel screen's single
+ * grid.
+ *
+ * A `LazyGridScope` extension rather than a composable so the content shares
+ * the header's scroller: a tab that owned its own scroller would mean the
+ * header could not scroll away, which is the whole feel of the page.
+ */
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
+internal fun LazyGridScope.channelTabContent(
+    tabKind: ChannelTabKind,
+    page: ChannelTabPage?,
+    isTabLoading: Boolean,
+    about: ChannelAbout?,
+    isAboutLoading: Boolean,
+    onPlayVideo: (VideoItem) -> Unit,
+    onVideoLongPress: (VideoItem) -> Unit,
+    onOpenShorts: (List<ShortsItem>, Int) -> Unit,
+    onOpenPlaylist: (VideoPlaylist) -> Unit,
+    onOpenChannel: (String) -> Unit,
+    onSelectSort: (ChannelSortOption) -> Unit,
+    /** Open post photos in the fullscreen zoomable viewer, at [Int]. */
+    onOpenPhotos: (List<String>, Int) -> Unit = { _, _ -> },
+    /** Open a community post's comments. Required: a default would ship posts with a dead button. */
+    onOpenComments: (ChannelPost) -> Unit,
+    postActions: com.zyrox.music.video.PostCardActions
+) {
+    if (tabKind == ChannelTabKind.ABOUT) {
+        aboutTab(about = about, isLoading = isAboutLoading)
+        return
+    }
+
+    if (isTabLoading && (page == null || page.isEmpty)) {
+        item(key = "tab_loading", span = { GridItemSpan(maxLineSpan) }) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 64.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                LoadingIndicator(modifier = Modifier.size(44.dp))
+            }
+        }
+        return
+    }
+
+    if (page == null || page.isEmpty) {
+        item(key = "tab_empty", span = { GridItemSpan(maxLineSpan) }) {
+            ChannelEmptyState(tabKind = tabKind)
+        }
+        return
+    }
+
+    if (page.sortOptions.size > 1) {
+        item(key = "sort", span = { GridItemSpan(maxLineSpan) }) {
+            ChannelSortRow(options = page.sortOptions, onSelect = onSelectSort)
+        }
+    }
+
+    page.featured?.let { featured ->
+        item(key = "featured_${featured.videoId}", span = { GridItemSpan(maxLineSpan) }) {
+            FeaturedVideoCard(
+                video = featured,
+                onClick = { onPlayVideo(featured) },
+                onLongClick = { onVideoLongPress(featured) }
+            )
+        }
+    }
+
+    // Home: the channel's own arrangement of shelves, in its order.
+    page.shelves.forEachIndexed { index, shelf ->
+        item(key = "shelf_${index}_${shelf.title}", span = { GridItemSpan(maxLineSpan) }) {
+            ChannelShelfRow(
+                shelf = shelf,
+                onPlayVideo = onPlayVideo,
+                onVideoLongPress = onVideoLongPress,
+                onOpenShorts = onOpenShorts,
+                onOpenPlaylist = onOpenPlaylist,
+                onOpenChannel = onOpenChannel,
+                onOpenPhotos = onOpenPhotos,
+                onOpenComments = onOpenComments,
+                postActions = postActions
+            )
+        }
+    }
+
+    spanItems(page.videos, key = { "video_${it.videoId}" }) { video ->
+        VideoCard(
+            video = video,
+            onClick = { onPlayVideo(video) },
+            onLongClick = { onVideoLongPress(video) },
+            onOpenChannel = onOpenChannel
+        )
+    }
+
+    spanItemsIndexed(
+        items = page.shorts,
+        span = SHORT_SPAN,
+        key = { _, short -> "short_${short.videoId}" }
+    ) { index, short ->
+        ShortCard(short = short, onClick = { onOpenShorts(page.shorts, index) })
+    }
+
+    spanItems(
+        items = page.playlists,
+        span = PLAYLIST_SPAN,
+        key = { "playlist_${it.playlistId}" }
+    ) { playlist ->
+        ChannelPlaylistCard(playlist = playlist, onClick = { onOpenPlaylist(playlist) })
+    }
+
+    spanItems(page.posts, key = { "post_${it.postId}" }) { post ->
+        ChannelPostCard(
+            post = post,
+            actions = postActions,
+            onPlayVideo = onPlayVideo,
+            onOpenPhotos = onOpenPhotos,
+            onOpenComments = post.detailParams?.let { { onOpenComments(post) } }
+        )
+    }
+}
+
+/**
+ * A list of items at a fixed span, or full width when [span] is null.
+ *
+ * These two helpers exist because `LazyGridScope` carries a `count`-based
+ * `items` **member**, and a member shadows the list-taking extension of the
+ * same name: calling `items(items = …, span = …)` resolves to the member and
+ * fails on the argument names. Routing every list through the member once, here,
+ * is less surprising than importing the extension and hoping resolution goes the
+ * other way.
+ */
+private fun <T> LazyGridScope.spanItems(
+    items: List<T>,
+    span: Int? = null,
+    key: (T) -> Any,
+    itemContent: @Composable (T) -> Unit
+) {
+    if (items.isEmpty()) return
+    items(
+        count = items.size,
+        key = { index -> key(items[index]) },
+        span = { GridItemSpan(span ?: maxLineSpan) }
+    ) { index ->
+        itemContent(items[index])
+    }
+}
+
+/**
+ * The same, keeping the index. Shorts need it: tapping the fourth Short has to
+ * open the reel at position four, not search the list for it by id, because a
+ * channel can list the same Short twice.
+ */
+private fun <T> LazyGridScope.spanItemsIndexed(
+    items: List<T>,
+    span: Int,
+    key: (Int, T) -> Any,
+    itemContent: @Composable (Int, T) -> Unit
+) {
+    if (items.isEmpty()) return
+    items(
+        count = items.size,
+        key = { index -> key(index, items[index]) },
+        span = { GridItemSpan(span) }
+    ) { index ->
+        itemContent(index, items[index])
+    }
+}
+
+private const val SHORT_SPAN = 2
+private const val PLAYLIST_SPAN = 3
+
+/**
+ * The sort chips ("Latest", "Popular", "Oldest").
+ *
+ * A menu rather than a chip row because the options are mutually exclusive and
+ * there are never more than a handful, and because the current sort has to stay
+ * visible while the grid scrolls past - which a row of chips scrolled off the
+ * top cannot do.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ChannelSortRow(
+    options: List<ChannelSortOption>,
+    onSelect: (ChannelSortOption) -> Unit
+) {
+    var expanded by remember { mutableStateOf(false) }
+    val current = options.firstOrNull { it.selected } ?: options.first()
+
+    Box(modifier = Modifier.padding(top = 4.dp)) {
+        Surface(
+            onClick = { expanded = true },
+            shape = RoundedCornerShape(18.dp),
+            color = MaterialTheme.colorScheme.surfaceContainerHigh,
+            contentColor = MaterialTheme.colorScheme.onSurface
+        ) {
+            Row(
+                modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Icon(Icons.AutoMirrored.Rounded.Sort, contentDescription = null, modifier = Modifier.size(18.dp))
+                Text(
+                    text = current.label,
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.Medium
+                )
+            }
+        }
+        DropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { expanded = false }
+        ) {
+            options.forEach { option ->
+                DropdownMenuItem(
+                    text = {
+                        Text(
+                            text = option.label,
+                            fontWeight = if (option.selected) FontWeight.Bold else FontWeight.Normal
+                        )
+                    },
+                    onClick = {
+                        expanded = false
+                        if (!option.selected) onSelect(option)
+                    }
+                )
+            }
+        }
+    }
+}
+
+/** The pinned video at the top of a channel's Home tab, given the space it asks for. */
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun FeaturedVideoCard(
+    video: VideoItem,
+    onClick: () -> Unit,
+    onLongClick: () -> Unit
+) {
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(20.dp))
+            .combinedClickable(onClick = onClick, onLongClick = onLongClick),
+        shape = RoundedCornerShape(20.dp),
+        color = MaterialTheme.colorScheme.surfaceContainer
+    ) {
+        Column {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .aspectRatio(16f / 9f)
+            ) {
+                VideoThumbnail(
+                    video = video,
+                    modifier = Modifier.fillMaxSize()
+                )
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(
+                            Brush.verticalGradient(
+                                listOf(Color.Transparent, Color.Black.copy(alpha = 0.55f))
+                            )
+                        )
+                )
+                Surface(
+                    modifier = Modifier
+                        .align(Alignment.TopStart)
+                        .padding(12.dp),
+                    shape = RoundedCornerShape(8.dp),
+                    color = MaterialTheme.colorScheme.primary
+                ) {
+                    Text(
+                        text = "Featured",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onPrimary,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                    )
+                }
+                Icon(
+                    imageVector = Icons.Rounded.PlayArrow,
+                    contentDescription = null,
+                    tint = Color.White,
+                    modifier = Modifier
+                        .align(Alignment.Center)
+                        .size(52.dp)
+                )
+            }
+            Column(modifier = Modifier.padding(14.dp)) {
+                Text(
+                    text = video.title,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+                val metadata = listOfNotNull(
+                    video.viewCount.takeIf { it.isNotBlank() },
+                    video.uploadedDate?.takeIf { it.isNotBlank() }
+                ).joinToString(" • ")
+                if (metadata.isNotBlank()) {
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        text = metadata,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+        }
+    }
+}
+
+/** One Home-tab shelf, whatever it happens to contain. */
+@Composable
+private fun ChannelShelfRow(
+    shelf: ChannelShelf,
+    onPlayVideo: (VideoItem) -> Unit,
+    onVideoLongPress: (VideoItem) -> Unit,
+    onOpenShorts: (List<ShortsItem>, Int) -> Unit,
+    onOpenPlaylist: (VideoPlaylist) -> Unit,
+    onOpenChannel: (String) -> Unit,
+    onOpenPhotos: (List<String>, Int) -> Unit = { _, _ -> },
+    onOpenComments: (ChannelPost) -> Unit,
+    postActions: com.zyrox.music.video.PostCardActions
+) {
+    Column(modifier = Modifier.bleedHorizontally().fillMaxWidth()) {
+        Text(
+            text = shelf.title,
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.Bold,
+            color = MaterialTheme.colorScheme.onSurface,
+            modifier = Modifier.padding(start = CHANNEL_GUTTER, bottom = 10.dp)
+        )
+        LazyRow(
+            contentPadding = PaddingValues(horizontal = CHANNEL_GUTTER),
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            items(shelf.videos, key = { "sv_${it.videoId}" }) { video ->
+                ShelfVideoCard(
+                    video = video,
+                    onClick = { onPlayVideo(video) },
+                    onLongClick = { onVideoLongPress(video) }
+                )
+            }
+            itemsIndexed(shelf.shorts, key = { _, s -> "ss_${s.videoId}" }) { index, short ->
+                ShortCard(
+                    short = short,
+                    onClick = { onOpenShorts(shelf.shorts, index) },
+                    modifier = Modifier.width(130.dp)
+                )
+            }
+            items(shelf.playlists, key = { "sp_${it.playlistId}" }) { playlist ->
+                ChannelPlaylistCard(
+                    playlist = playlist,
+                    onClick = { onOpenPlaylist(playlist) },
+                    modifier = Modifier.width(180.dp)
+                )
+            }
+            items(shelf.channels, key = { "sc_${it.channelId}" }) { channel ->
+                ShelfChannelCard(channel = channel, onClick = { onOpenChannel(channel.channelId) })
+            }
+            items(shelf.posts, key = { "spo_${it.postId}" }) { post ->
+                ChannelPostCard(
+                    post = post,
+                    actions = postActions,
+                    onPlayVideo = onPlayVideo,
+                    onOpenPhotos = onOpenPhotos,
+                    onOpenComments = post.detailParams?.let { { onOpenComments(post) } },
+                    modifier = Modifier.width(300.dp)
+                )
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun ShelfVideoCard(
+    video: VideoItem,
+    onClick: () -> Unit,
+    onLongClick: () -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .width(220.dp)
+            .clip(RoundedCornerShape(16.dp))
+            .combinedClickable(onClick = onClick, onLongClick = onLongClick)
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .aspectRatio(16f / 9f)
+                .clip(RoundedCornerShape(14.dp))
+                .background(MaterialTheme.colorScheme.surfaceContainerHighest)
+        ) {
+            VideoThumbnail(
+                thumbnailUrl = video.thumbnailUrl,
+                contentDescription = video.title,
+                modifier = Modifier.fillMaxSize(),
+                indicatorSize = 28.dp
+            )
+            VideoThumbnailBadge(
+                video = video,
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(6.dp)
+            )
+        }
+        Column(
+            modifier = Modifier.padding(
+                start = 8.dp,
+                top = 8.dp,
+                end = 8.dp,
+                bottom = 10.dp
+            )
+        ) {
+            Text(
+                text = video.title,
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onSurface,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+            val metadata = listOfNotNull(
+                video.viewCount.takeIf { it.isNotBlank() },
+                video.uploadedDate?.takeIf { it.isNotBlank() }
+            ).joinToString(" • ")
+            if (metadata.isNotBlank()) {
+                Text(
+                    text = metadata,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ShelfChannelCard(channel: SubscribedChannel, onClick: () -> Unit) {
+    Column(
+        modifier = Modifier
+            .width(120.dp)
+            .clip(RoundedCornerShape(16.dp))
+            .combinedClickableCompat(onClick)
+            // Inside the clip, so the press stays rounded but the text clears
+            // the corners: the subscriber line used to sit on the clip's bottom
+            // edge and lose its ends to it.
+            .padding(horizontal = 8.dp, vertical = 8.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        CreatorAvatar(
+            avatarUrl = channel.avatarUrl,
+            name = channel.name,
+            modifier = Modifier.size(76.dp)
+        )
+        Spacer(Modifier.height(8.dp))
+        Text(
+            text = channel.name,
+            style = MaterialTheme.typography.bodySmall,
+            fontWeight = FontWeight.SemiBold,
+            color = MaterialTheme.colorScheme.onSurface,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+            textAlign = TextAlign.Center
+        )
+        channel.subscriberCountText?.takeIf { it.isNotBlank() }?.let {
+            Text(
+                text = it,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                textAlign = TextAlign.Center
+            )
+        }
+    }
+}
+
+@Composable
+private fun ShortCard(
+    short: ShortsItem,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Column(
+        modifier = modifier
+            .clip(RoundedCornerShape(14.dp))
+            .combinedClickableCompat(onClick)
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .aspectRatio(9f / 16f)
+                .clip(RoundedCornerShape(14.dp))
+                .background(MaterialTheme.colorScheme.surfaceContainerHighest)
+        ) {
+            AsyncImage(
+                model = short.portraitThumbnailUrl,
+                contentDescription = short.title,
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.Crop
+            )
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(
+                        Brush.verticalGradient(
+                            listOf(Color.Transparent, Color.Black.copy(alpha = 0.7f))
+                        )
+                    )
+            )
+            Column(
+                modifier = Modifier
+                    .align(Alignment.BottomStart)
+                    .padding(8.dp)
+            ) {
+                if (short.title.isNotBlank()) {
+                    Text(
+                        text = short.title,
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = Color.White,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+                if (short.viewCount.isNotBlank()) {
+                    Text(
+                        text = short.viewCount,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = Color.White.copy(alpha = 0.8f),
+                        maxLines = 1
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ChannelPlaylistCard(
+    playlist: VideoPlaylist,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Column(
+        modifier = modifier
+            .clip(RoundedCornerShape(16.dp))
+            .combinedClickableCompat(onClick)
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .aspectRatio(16f / 9f)
+                .clip(RoundedCornerShape(14.dp))
+                .background(MaterialTheme.colorScheme.surfaceContainerHighest)
+        ) {
+            if (playlist.thumbnailUrl != null) {
+                AsyncImage(
+                    model = playlist.thumbnailUrl,
+                    contentDescription = playlist.title,
+                    modifier = Modifier.fillMaxSize(),
+                    contentScale = ContentScale.Crop
+                )
+            }
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(
+                        Brush.verticalGradient(
+                            listOf(Color.Transparent, Color.Black.copy(alpha = 0.6f))
+                        )
+                    )
+            )
+            playlist.videoCountText?.let { count ->
+                Surface(
+                    modifier = Modifier
+                        .align(Alignment.BottomEnd)
+                        .padding(6.dp),
+                    shape = RoundedCornerShape(6.dp),
+                    color = Color.Black.copy(alpha = 0.75f)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Icon(
+                            Icons.Rounded.VideoLibrary,
+                            contentDescription = null,
+                            tint = Color.White,
+                            modifier = Modifier.size(12.dp)
+                        )
+                        Text(
+                            text = count,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = Color.White
+                        )
+                    }
+                }
+            }
+        }
+        Column(
+            modifier = Modifier.padding(
+                start = 8.dp,
+                top = 8.dp,
+                end = 8.dp,
+                bottom = 10.dp
+            )
+        ) {
+            Text(
+                text = playlist.title,
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onSurface,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis
+            )
+            playlist.subtitle?.takeIf { it.isNotBlank() }?.let {
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    text = it,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
+    }
+}
+
+/**
+ * What a tab says when it genuinely has nothing in it.
+ *
+ * Worded per tab rather than one "Nothing here": a channel with no posts and a
+ * channel whose videos failed to load are different situations, and a single
+ * message would describe one of them wrongly.
+ */
+@Composable
+private fun ChannelEmptyState(tabKind: ChannelTabKind) {
+    val (icon, message) = when (tabKind) {
+        ChannelTabKind.SHORTS -> Icons.Rounded.PlayArrow to "This channel hasn't posted any Shorts"
+        ChannelTabKind.LIVE -> Icons.Rounded.Visibility to "No past or upcoming live streams"
+        ChannelTabKind.PLAYLISTS -> Icons.Rounded.VideoLibrary to "No public playlists"
+        ChannelTabKind.POSTS -> Icons.AutoMirrored.Rounded.Article to "No community posts yet"
+        ChannelTabKind.VIDEOS -> Icons.Rounded.VideoLibrary to "No videos here yet"
+        else -> Icons.Rounded.VideoLibrary to "Nothing to show in this tab"
+    }
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 32.dp, vertical = 56.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Surface(
+            shape = CircleShape,
+            color = MaterialTheme.colorScheme.surfaceContainerHigh,
+            modifier = Modifier.size(60.dp)
+        ) {
+            Box(contentAlignment = Alignment.Center) {
+                Icon(
+                    icon,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(26.dp)
+                )
+            }
+        }
+        Spacer(Modifier.height(14.dp))
+        Text(
+            text = message,
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// About
+// ---------------------------------------------------------------------------
+
+private fun LazyGridScope.aboutTab(about: ChannelAbout?, isLoading: Boolean) {
+    if (isLoading && about == null) {
+        item(key = "about_loading", span = { GridItemSpan(maxLineSpan) }) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 64.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                LoadingIndicator(modifier = Modifier.size(44.dp))
+            }
+        }
+        return
+    }
+    if (about == null) {
+        item(key = "about_empty", span = { GridItemSpan(maxLineSpan) }) {
+            ChannelEmptyState(tabKind = ChannelTabKind.OTHER)
+        }
+        return
+    }
+
+    if (!about.description.isNullOrBlank()) {
+        item(key = "about_description", span = { GridItemSpan(maxLineSpan) }) {
+            AboutCard(title = "Description") {
+                // The bio arrives as a bare string, so its addresses, emails
+                // and @handles are found here; a YouTube one opens in ZYROX MUSIC.
+                val linkified = remember(about.description) {
+                    com.zyrox.music.data.linkifyPlainText(about.description)
+                }
+                Text(
+                    text = com.zyrox.music.ui.components.rememberLinkedText(linkified),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+    }
+
+    if (about.links.isNotEmpty()) {
+        item(key = "about_links", span = { GridItemSpan(maxLineSpan) }) {
+            val uriHandler = LocalUriHandler.current
+            AboutCard(title = "Links") {
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    about.links.forEach { link ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(12.dp))
+                                .combinedClickableCompat {
+                                    runCatching { uriHandler.openUri(link.url) }
+                                }
+                                .padding(vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            if (link.faviconUrl != null) {
+                                AsyncImage(
+                                    model = link.faviconUrl,
+                                    contentDescription = null,
+                                    modifier = Modifier
+                                        .size(20.dp)
+                                        .clip(RoundedCornerShape(4.dp))
+                                )
+                            } else {
+                                Icon(
+                                    Icons.Rounded.Link,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                            }
+                            Text(
+                                text = link.title,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.primary,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    val stats = listOfNotNull(
+        about.subscriberCountText?.let { Icons.Rounded.Person to it },
+        about.videoCountText?.let { Icons.Rounded.VideoLibrary to it },
+        about.viewCountText?.let { Icons.Rounded.Visibility to it },
+        about.joinedDateText?.let { Icons.Rounded.CalendarMonth to it },
+        about.country?.let { Icons.Rounded.Public to it }
+    )
+    if (stats.isNotEmpty()) {
+        item(key = "about_stats", span = { GridItemSpan(maxLineSpan) }) {
+            AboutCard(title = "Details") {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    stats.forEach { (icon, text) ->
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            Icon(
+                                icon,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Text(
+                                text = text,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AboutCard(title: String, content: @Composable () -> Unit) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(20.dp),
+        color = MaterialTheme.colorScheme.surfaceContainer
+    ) {
+        Column(modifier = Modifier.padding(18.dp)) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.onSurface
+            )
+            Spacer(Modifier.height(10.dp))
+            content()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Community posts
+// ---------------------------------------------------------------------------
+
+/**
+ * One community post: text, then whichever single attachment it carried.
+ *
+ * A single image is shown at its own ratio. A multi-image post is a carousel
+ * on YouTube, so it is one here too: a swipeable pager of square pages with a
+ * page indicator ([PostImageCarousel]), each page opening the fullscreen
+ * viewer on that photo.
+ */
+@Composable
+internal fun ChannelPostCard(
+    post: ChannelPost,
+    actions: com.zyrox.music.video.PostCardActions,
+    onPlayVideo: (VideoItem) -> Unit,
+    /** Null when the post has no page of its own to hang comments off. */
+    onOpenComments: (() -> Unit)?,
+    modifier: Modifier = Modifier,
+    onOpenPhotos: (List<String>, Int) -> Unit = { _, _ -> },
+    /**
+     * Opens the author's channel. Null on the channel page itself, where the
+     * author is the page; set where a post is met in a feed.
+     */
+    onAuthorClick: (() -> Unit)? = null
+) {
+    val shown = actions.edits[post.postId] ?: post
+    Surface(
+        modifier = modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(20.dp),
+        color = MaterialTheme.colorScheme.surfaceContainer
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Row(
+                modifier = if (onAuthorClick != null) {
+                    Modifier
+                        .clip(RoundedCornerShape(12.dp))
+                        .clickable(onClick = onAuthorClick)
+                } else {
+                    Modifier
+                },
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                CreatorAvatar(
+                    avatarUrl = post.authorAvatarUrl,
+                    name = post.authorName,
+                    modifier = Modifier.size(36.dp)
+                )
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = post.authorName,
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    post.publishedText?.let {
+                        Text(
+                            text = it,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+
+            if (!post.text.isBlank) {
+                Spacer(Modifier.height(10.dp))
+                // Press and hold to select or copy; the links still open on a tap.
+                androidx.compose.foundation.text.selection.SelectionContainer {
+                    Text(
+                        text = com.zyrox.music.ui.components.rememberLinkedText(post.text),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                }
+            }
+
+            if (post.images.isNotEmpty()) {
+                Spacer(Modifier.height(12.dp))
+                if (post.images.size == 1) {
+                    AsyncImage(
+                        model = post.images.first(),
+                        contentDescription = null,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(14.dp))
+                            .combinedClickableCompat { onOpenPhotos(post.images, 0) },
+                        contentScale = ContentScale.FillWidth
+                    )
+                } else {
+                    PostImageCarousel(
+                        images = post.images,
+                        onOpenPhoto = { index -> onOpenPhotos(post.images, index) }
+                    )
+                }
+            }
+
+            post.video?.let { video ->
+                Spacer(Modifier.height(12.dp))
+                ShelfVideoCard(
+                    video = video,
+                    onClick = { onPlayVideo(video) },
+                    onLongClick = {}
+                )
+            }
+
+            if (shown.pollChoices.isNotEmpty()) {
+                Spacer(Modifier.height(12.dp))
+                PostPoll(
+                    post = shown,
+                    showResults = shown.hasVoted || !actions.signedIn,
+                    onChoose = { index -> actions.onPollChoice(shown, index) }
+                )
+            }
+
+            if (shown.voteCountText != null || shown.likeAction != null ||
+                post.replyCountText != null || onOpenComments != null
+            ) {
+                Spacer(Modifier.height(10.dp))
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    PostLikeButton(post = shown, onClick = { actions.onToggleLike(shown) })
+                    if (onOpenComments != null) {
+                        PostCommentsButton(countText = post.replyCountText, onClick = onOpenComments)
+                    } else {
+                        post.replyCountText?.let {
+                            Text(
+                                text = it,
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** Like and its count, on the same pill as the comments button beside it. */
+@Composable
+private fun PostLikeButton(post: ChannelPost, onClick: () -> Unit) {
+    val haptics = com.zyrox.music.util.rememberZyroxHaptics()
+    val description = stringResource(
+        if (post.isLiked) R.string.ch_post_unlike else R.string.ch_post_like
+    )
+    Surface(
+        onClick = {
+            haptics.subtle()
+            onClick()
+        },
+        shape = CircleShape,
+        color = if (post.isLiked) {
+            MaterialTheme.colorScheme.primaryContainer
+        } else {
+            MaterialTheme.colorScheme.surfaceContainerHigh
+        },
+        contentColor = if (post.isLiked) {
+            MaterialTheme.colorScheme.onPrimaryContainer
+        } else {
+            MaterialTheme.colorScheme.onSurface
+        },
+        modifier = Modifier
+            .heightIn(min = 40.dp)
+            .semantics { contentDescription = description }
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)
+        ) {
+            Icon(Icons.Rounded.ThumbUp, contentDescription = null, modifier = Modifier.size(18.dp))
+            post.voteCountText?.let { Text(text = it, style = MaterialTheme.typography.labelLarge) }
+        }
+    }
+}
+
+/**
+ * A community poll. Results stay hidden until you vote, as on YouTube, so they
+ * cannot sway the vote; signed out there is no vote to give, so they show.
+ * Tapping your own choice takes the vote back.
+ */
+@Composable
+private fun PostPoll(post: ChannelPost, showResults: Boolean, onChoose: (Int) -> Unit) {
+    val haptics = com.zyrox.music.util.rememberZyroxHaptics()
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        post.pollChoices.forEachIndexed { index, choice ->
+            val share by androidx.compose.animation.core.animateFloatAsState(
+                targetValue = if (showResults) choice.shareRatio() else 0f,
+                animationSpec = androidx.compose.animation.core.tween(350),
+                label = "pollShare"
+            )
+            val fill = pollFill(choice.isSelected)
+            Surface(
+                onClick = {
+                    haptics.subtle()
+                    onChoose(index)
+                },
+                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                shape = RoundedCornerShape(12.dp),
+                color = MaterialTheme.colorScheme.surfaceContainerHigh
+            ) {
+                Box(contentAlignment = Alignment.CenterStart) {
+                    Box(
+                        modifier = Modifier
+                            .matchParentSize()
+                            .drawBehind {
+                                drawRect(
+                                    color = fill,
+                                    size = size.copy(width = size.width * share)
+                                )
+                            }
+                    )
+                    Row(
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        choice.imageUrl?.let { image ->
+                            AsyncImage(
+                                model = image,
+                                contentDescription = null,
+                                modifier = Modifier.size(40.dp).clip(RoundedCornerShape(8.dp)),
+                                contentScale = ContentScale.Crop
+                            )
+                        }
+                        Text(
+                            text = choice.text,
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = if (choice.isSelected) FontWeight.SemiBold else FontWeight.Normal,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            modifier = Modifier.weight(1f)
+                        )
+                        if (choice.isSelected) {
+                            Icon(
+                                Icons.Rounded.Check,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+                        if (showResults) {
+                            choice.shareText()?.let {
+                                Text(
+                                    text = it,
+                                    style = MaterialTheme.typography.labelLarge,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        post.pollTotalText?.let {
+            Text(
+                text = it,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+    }
+}
+
+@Composable
+private fun pollFill(selected: Boolean): androidx.compose.ui.graphics.Color =
+    if (selected) {
+        MaterialTheme.colorScheme.primary.copy(alpha = 0.24f)
+    } else {
+        MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f)
+    }
+
+/**
+ * The post a comments sheet belongs to, compact: who, when, and the first
+ * lines of what they said, with a thumbnail of the first image when the post
+ * has no text. Enough to keep replies in context without pushing the thread
+ * off a short screen; the full post is one swipe down, behind the sheet.
+ */
+@Composable
+internal fun PostCommentsContext(post: ChannelPost) {
+    Surface(
+        shape = RoundedCornerShape(16.dp),
+        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Row(
+            modifier = Modifier.padding(12.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            CreatorAvatar(
+                avatarUrl = post.authorAvatarUrl,
+                name = post.authorName,
+                modifier = Modifier.size(32.dp)
+            )
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = listOfNotNull(
+                        post.authorName.takeIf { it.isNotBlank() },
+                        post.publishedText
+                    ).joinToString(" · "),
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                if (!post.text.isBlank) {
+                    Text(
+                        text = post.text.text,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 3,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+            val image = post.images.firstOrNull()
+                ?: post.video?.thumbnailUrl
+            if (image != null && post.text.isBlank) {
+                AsyncImage(
+                    model = image,
+                    contentDescription = null,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier
+                        .size(56.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                )
+            }
+        }
+    }
+}
+
+/**
+ * The way into a post's comments: a tonal pill carrying the count, so the
+ * number that used to be a dead label is also the thing to tap. 40dp tall with
+ * a 48dp touch target, like the players' action pills.
+ */
+@Composable
+private fun PostCommentsButton(countText: String?, onClick: () -> Unit) {
+    val label = countText?.takeIf { it.isNotBlank() }
+    val description = stringResource(R.string.ch_post_open_comments)
+    Surface(
+        onClick = onClick,
+        shape = CircleShape,
+        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+        contentColor = MaterialTheme.colorScheme.onSurface,
+        modifier = Modifier
+            .heightIn(min = 40.dp)
+            .semantics { contentDescription = description }
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)
+        ) {
+            Icon(
+                Icons.AutoMirrored.Rounded.Comment,
+                contentDescription = null,
+                modifier = Modifier.size(18.dp)
+            )
+            Text(
+                text = label ?: stringResource(R.string.cd_comments),
+                style = MaterialTheme.typography.labelLarge
+            )
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Search within the channel
+// ---------------------------------------------------------------------------
+
+/**
+ * Search over one creator's whole back catalogue.
+ *
+ * A full-surface mode rather than a tab, because it needs a text field and the
+ * keyboard, and because on a channel with two thousand uploads it is the main
+ * way anyone finds anything.
+ */
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
+@Composable
+internal fun ChannelSearchPane(
+    channelName: String,
+    query: String,
+    results: List<VideoItem>,
+    isSearching: Boolean,
+    searchRan: Boolean,
+    onQueryChange: (String) -> Unit,
+    onVideoClick: (VideoItem) -> Unit,
+    onVideoLongPress: (VideoItem) -> Unit,
+    onOpenChannel: (String) -> Unit,
+    onClose: () -> Unit,
+    contentPadding: PaddingValues
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.surface)
+            .padding(top = 0.dp)
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .windowInsetsPadding(WindowInsets.statusBars)
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Surface(
+                onClick = onClose,
+                shape = CircleShape,
+                color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                modifier = Modifier.size(44.dp)
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(Icons.Rounded.Close, contentDescription = "Close search")
+                }
+            }
+            SearchField(
+                query = query,
+                onQueryChange = onQueryChange,
+                placeholder = "Search $channelName",
+                modifier = Modifier.weight(1f)
+            )
+        }
+
+        when {
+            isSearching -> Box(
+                modifier = Modifier.fillMaxSize(),
+                contentAlignment = Alignment.Center
+            ) {
+                LoadingIndicator(modifier = Modifier.size(44.dp))
+            }
+
+            results.isEmpty() && searchRan -> Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(32.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center
+            ) {
+                Icon(
+                    Icons.Rounded.Search,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(36.dp)
+                )
+                Spacer(Modifier.height(12.dp))
+                Text(
+                    text = "Nothing in this channel matches \"$query\"",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = TextAlign.Center
+                )
+            }
+
+            results.isEmpty() -> Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(32.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center
+            ) {
+                Icon(
+                    Icons.Rounded.Search,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(36.dp)
+                )
+                Spacer(Modifier.height(12.dp))
+                Text(
+                    text = "Search everything $channelName has published",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = TextAlign.Center
+                )
+            }
+
+            else -> LazyColumn(
+                contentPadding = PaddingValues(
+                    start = CHANNEL_GUTTER,
+                    end = CHANNEL_GUTTER,
+                    top = 8.dp,
+                    bottom = contentPadding.calculateBottomPadding() + 120.dp
+                ),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                items(results, key = { it.videoId }) { video ->
+                    VideoCard(
+                        video = video,
+                        onClick = { onVideoClick(video) },
+                        onLongClick = { onVideoLongPress(video) },
+                        onOpenChannel = onOpenChannel
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * A multi-image post's photos as a swipeable pager: square pages cropped the
+ * way YouTube's own carousel crops them, a "2 / 5" badge on the photo and a
+ * row of dots under it. A tap opens the fullscreen viewer on the photo shown.
+ *
+ * The pager sits inside vertical lists (the channel's Posts tab, the
+ * Subscriptions Posts view); a horizontal drag goes to the pager and a
+ * vertical one still scrolls the list. Pages are not keyed by URL, because a
+ * post can carry the same image twice and a duplicate key would crash.
+ */
+@Composable
+private fun PostImageCarousel(
+    images: List<String>,
+    onOpenPhoto: (Int) -> Unit
+) {
+    val pagerState = rememberPagerState { images.size }
+    // A square as wide as a landscape window is taller than that window.
+    val maxSide = minOf(POST_CAROUSEL_MAX_SIDE, com.zyrox.music.ui.theme.windowDpSize().height * 0.8f)
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Box(
+            modifier = Modifier
+                .widthIn(max = maxSide)
+                .fillMaxWidth()
+                .aspectRatio(1f)
+                .clip(RoundedCornerShape(14.dp))
+                .background(MaterialTheme.colorScheme.surfaceContainerHigh)
+        ) {
+            HorizontalPager(
+                state = pagerState,
+                modifier = Modifier.fillMaxSize(),
+                pageSpacing = 8.dp,
+                beyondViewportPageCount = 1
+            ) { page ->
+                AsyncImage(
+                    model = images[page],
+                    contentDescription = stringResource(
+                        R.string.ch_post_photo_position,
+                        page + 1,
+                        images.size
+                    ),
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .clip(RoundedCornerShape(14.dp))
+                        .combinedClickableCompat { onOpenPhoto(page) },
+                    contentScale = ContentScale.Crop
+                )
+            }
+            com.zyrox.music.ui.components.ThumbnailBadge(
+                text = "${pagerState.currentPage + 1} / ${images.size}",
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(8.dp)
+            )
+        }
+        Spacer(Modifier.height(8.dp))
+        PostPageIndicator(
+            pageCount = images.size,
+            currentPage = pagerState.currentPage
+        )
+    }
+}
+
+/**
+ * Dots under a post's carousel; the current one stretches into a pill. Past
+ * [MAX_DOTS] pages only the badge on the photo counts, since a row of twenty
+ * dots says nothing a "7 / 20" does not.
+ */
+@Composable
+private fun PostPageIndicator(pageCount: Int, currentPage: Int) {
+    if (pageCount > MAX_DOTS) return
+    Row(
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        repeat(pageCount) { index ->
+            val selected = index == currentPage
+            val width by androidx.compose.animation.core.animateDpAsState(
+                targetValue = if (selected) 18.dp else 6.dp,
+                animationSpec = androidx.compose.animation.core.spring(
+                    dampingRatio = androidx.compose.animation.core.Spring.DampingRatioMediumBouncy,
+                    stiffness = androidx.compose.animation.core.Spring.StiffnessMedium
+                ),
+                label = "postPageDot"
+            )
+            val color by androidx.compose.animation.animateColorAsState(
+                targetValue = if (selected) {
+                    MaterialTheme.colorScheme.primary
+                } else {
+                    MaterialTheme.colorScheme.outlineVariant
+                },
+                label = "postPageDotColor"
+            )
+            Box(
+                modifier = Modifier
+                    .height(6.dp)
+                    .width(width)
+                    .clip(CircleShape)
+                    .background(color)
+            )
+        }
+    }
+}
+
+private const val MAX_DOTS = 10
+
+/** Widest a post's carousel is drawn, on any surface. */
+private val POST_CAROUSEL_MAX_SIDE = 480.dp
+
+/**
+ * `clickable` with the ripple clipped to the shape already applied above it,
+ * matching the note on [VideoCard]: a Surface applies its own clip downstream,
+ * so a click registered higher spills into square corners.
+ */
+@OptIn(ExperimentalFoundationApi::class)
+private fun Modifier.combinedClickableCompat(onClick: () -> Unit): Modifier =
+    this.combinedClickable(onClick = onClick)
+
+// ---------------------------------------------------------------------------
+// Fullscreen photo viewer
+// ---------------------------------------------------------------------------
+
+/**
+ * A community post's photos, fullscreen: swipe between them, pinch or
+ * double-tap to zoom. Opened from [ChannelPostCard], hosted by the channel
+ * screen next to its options sheet.
+ */
+@Composable
+internal fun ChannelPhotoViewer(
+    images: List<String>,
+    startIndex: Int,
+    onDismiss: () -> Unit
+) {
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(
+            usePlatformDefaultWidth = false,
+            decorFitsSystemWindows = false
+        )
+    ) {
+        val pagerState = rememberPagerState(
+            initialPage = startIndex.coerceIn(images.indices)
+        ) { images.size }
+        BackHandler(onBack = onDismiss)
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color.Black)
+        ) {
+            // Always scrollable: a zoomed photo keeps the finger only while it
+            // has picture left to pan towards (see ZoomableChannelImage).
+            HorizontalPager(
+                state = pagerState,
+                modifier = Modifier.fillMaxSize(),
+                key = { images[it] }
+            ) { page ->
+                ZoomableChannelImage(
+                    imageUrl = images[page],
+                    isCurrent = pagerState.settledPage == page
+                )
+            }
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .windowInsetsPadding(WindowInsets.statusBars)
+                    .padding(8.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Surface(
+                    onClick = onDismiss,
+                    shape = CircleShape,
+                    color = Color.Black.copy(alpha = 0.6f),
+                    contentColor = Color.White,
+                    modifier = Modifier.size(44.dp)
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            Icons.Rounded.Close,
+                            contentDescription = "Close photos",
+                            modifier = Modifier.size(24.dp)
+                        )
+                    }
+                }
+                if (images.size > 1) {
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = Color.Black.copy(alpha = 0.6f)
+                    ) {
+                        Text(
+                            text = "${pagerState.currentPage + 1} / ${images.size}",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = Color.White,
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * One photo with pinch and double-tap zoom, 1x to 4x. Panning is clamped to
+ * the zoomed frame so the picture cannot be thrown off screen, and dropping
+ * back to 1x re-centres it.
+ *
+ * The photo and the pager share one finger the way a gallery does. At rest
+ * scale the photo takes nothing and the pager swipes. Zoomed, one finger pans
+ * the photo until it reaches its left or right edge; pushing on past the edge
+ * leaves the movement unconsumed, so the pager takes it and turns the page. A
+ * gesture that pinched at any point stays a zoom to its end, so pinching in
+ * near an edge never turns the page by surprise.
+ *
+ * Swiped away, the photo goes back to 1x, so coming back to it starts whole.
+ */
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun ZoomableChannelImage(
+    imageUrl: String,
+    isCurrent: Boolean
+) {
+    var scale by remember { mutableFloatStateOf(1f) }
+    var offset by remember { mutableStateOf(Offset.Zero) }
+    var layoutSize by remember { mutableStateOf(IntSize.Zero) }
+
+    fun setZoom(nextScale: Float, pan: Offset = Offset.Zero) {
+        scale = nextScale.coerceIn(1f, 4f)
+        if (scale <= 1f) {
+            offset = Offset.Zero
+        } else {
+            val maxX = (layoutSize.width * (scale - 1f) / 2f).coerceAtLeast(0f)
+            val maxY = (layoutSize.height * (scale - 1f) / 2f).coerceAtLeast(0f)
+            offset = Offset(
+                (offset.x + pan.x).coerceIn(-maxX, maxX),
+                (offset.y + pan.y).coerceIn(-maxY, maxY)
+            )
+        }
+    }
+
+    LaunchedEffect(isCurrent) {
+        if (!isCurrent) {
+            scale = 1f
+            offset = Offset.Zero
+        }
+    }
+
+    AsyncImage(
+        model = imageUrl,
+        contentDescription = null,
+        modifier = Modifier
+            .fillMaxSize()
+            .onSizeChanged { layoutSize = it }
+            .pointerInput(Unit) {
+                awaitEachGesture {
+                    awaitFirstDown(requireUnconsumed = false)
+                    var pinched = false
+                    do {
+                        val event = awaitPointerEvent()
+                        val fingers = event.changes.count { it.pressed }
+                        if (fingers >= 2) {
+                            pinched = true
+                            val zoom = event.calculateZoom()
+                            val pan = event.calculatePan()
+                            setZoom(scale * zoom, pan)
+                            event.changes.forEach { it.consume() }
+                        } else if (scale > 1.02f && event.changes.none { it.isConsumed }) {
+                            val pan = event.calculatePan()
+                            val before = offset
+                            setZoom(scale, pan)
+                            val movedX = offset.x - before.x
+                            // Mostly sideways and the picture could not follow:
+                            // it is at that edge, so the page may turn.
+                            val againstEdge = kotlin.math.abs(pan.x) > kotlin.math.abs(pan.y) &&
+                                kotlin.math.abs(movedX) < kotlin.math.abs(pan.x) * 0.5f
+                            if (pinched || !againstEdge) event.changes.forEach { it.consume() }
+                        }
+                    } while (event.changes.any { it.pressed })
+                }
+            }
+            .graphicsLayer(
+                scaleX = scale,
+                scaleY = scale,
+                translationX = offset.x,
+                translationY = offset.y
+            )
+            .combinedClickable(
+                onClick = {},
+                onDoubleClick = { if (scale > 1f) setZoom(1f) else setZoom(3f) }
+            ),
+        contentScale = ContentScale.Fit
+    )
+}
