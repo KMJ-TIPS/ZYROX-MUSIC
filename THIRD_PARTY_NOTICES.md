@@ -6,7 +6,7 @@ This file credits work that shaped ZYROX MUSIC's own code without being a depend
 
 ## Smooth motion (video frame interpolation)
 
-Smooth motion's engine is `app/src/main/java/com/ivor/ivormusic/service/ComputeMotionEngine.kt`, hosted in Media3's video pipeline by `FrameInterpolationShaderProgram.kt` and governed by `FrameInterpolation.kt` in the same package.
+Smooth motion's engine is `app/src/main/java/com/zyrox/music/service/ComputeMotionEngine.kt`, hosted in Media3's video pipeline by `FrameInterpolationShaderProgram.kt` and governed by `FrameInterpolation.kt` in the same package.
 
 - **How each in-between frame is drawn** - the renderer, its coverage and bad-area masks, scene classification and phase re-timing - **is a port of open-svpflow** (Apache License 2.0), translated from Rust into OpenGL ES 3.10 compute and fragment shaders for Media3. That part of `ComputeMotionEngine.kt` is a derivative work of open-svpflow and carries its licence, reproduced in full below.
 - **The motion search** (a luma pyramid, 8x8 block matching coarse to fine in both directions, a 3x3 vector median) is ZYROX MUSIC's own, written after studying AMD's FidelityFX SDK.

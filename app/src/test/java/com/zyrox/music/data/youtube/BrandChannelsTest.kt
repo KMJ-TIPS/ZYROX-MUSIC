@@ -58,7 +58,7 @@ class BrandChannelsTest {
 
         assertEquals(2, channels.size)
         val personal = channels[0]
-        assertEquals("Ivor", personal.name)
+        assertEquals("Zyrox", personal.name)
         assertEquals("@zyrox", personal.handle)
         assertNull(personal.pageId)
         assertEquals("111||", personal.datasyncId)
